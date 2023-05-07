@@ -11,15 +11,17 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    io::Write
 };
 
 use anyhow::{Context, Error, Result};
 use chrono::DateTime;
 use clap::Parser;
 use futures::future::ready;
+use futures::future::join_all;
 use futures::{stream, StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::{header, Response};
+use reqwest::{header, Response, Url};
 
 use canvas::{File, ProcessOptions};
 
@@ -83,10 +85,21 @@ async fn main() -> Result<()> {
         .http2_keep_alive_interval(Some(Duration::from_secs(2)))
         .build()
         .with_context(|| "Failed to create HTTP client")?;
+    let user_link = format!("{}/api/v1/users/self", cred.canvas_url);
+    let user = client
+        .get(&user_link)
+        .bearer_auth(&cred.canvas_token)
+        .send()
+        .await?
+        .json::<canvas::User>()
+        .await
+        .with_context(|| "Failed to get user info")?;
+
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
     let options = Arc::new(ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
         client: client.clone(),
+        user: user.clone(),
         // Process
         files_to_download: tokio::sync::Mutex::new(Vec::new()),
         download_newer: args.download_newer,
@@ -151,14 +164,7 @@ async fn main() -> Result<()> {
         let course_folder_path = args
             .destination_folder
             .join(course.course_code.replace('/', "_"));
-        if !course_folder_path.exists() {
-            std::fs::create_dir(&course_folder_path).with_context(|| {
-                format!(
-                    "Failed to create directory: {}",
-                    course_folder_path.to_string_lossy()
-                )
-            })?;
-        }
+        create_folder_if_not_exist(&course_folder_path).await?;
 
         // Prep URL for course's root folder
         let course_folders_link = format!(
@@ -166,12 +172,27 @@ async fn main() -> Result<()> {
             cred.canvas_url, course.id
         );
 
+        let course_folders_download_path = course_folder_path.join("files");
+        create_folder_if_not_exist(&course_folders_download_path).await?;
         fork!(
             process_folders,
-            (course_folders_link, course_folder_path),
+            (course_folders_link, course_folders_download_path),
             (String, PathBuf),
             options.clone()
         );
+
+        // Prep URL for course's root folder
+        let course_data_link = format!(
+            "{}/api/v1/courses/{}/",
+            cred.canvas_url, course.id
+        );
+
+        fork!(
+            process_data,
+            (course_data_link, course_folder_path),
+            (String, PathBuf),
+            options.clone()
+        )
     }
 
     // Invariants
@@ -231,6 +252,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn create_folder_if_not_exist(
+    folder_path: &PathBuf,
+) -> Result<()> {
+
+    if !folder_path.exists() {
+        std::fs::create_dir(&folder_path).with_context(|| {
+            format!(
+                "Failed to create directory: {}",
+                folder_path.to_string_lossy()
+            )
+        })?;
+    }
+
+    Ok(())
+}
 async fn atomic_download_file(file: File, options: Arc<ProcessOptions>) -> Result<()> {
     // Create tmp file from hash
     let mut tmp_path = file.filepath.clone();
@@ -400,6 +436,328 @@ async fn process_folders(
     Ok(())
 }
 
+async fn process_data(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+
+    let assignments_path = path.join("assignments");
+    create_folder_if_not_exist(&assignments_path).await?;
+    let assignments = process_assignments((url.clone(), assignments_path), options.clone());
+    let users_path = path.join("users.json");
+    let users = process_users((url.clone(), users_path), options.clone());
+    let discussions_path = path.join("discussions");
+    create_folder_if_not_exist(&discussions_path).await?;
+    let discussion = process_discussions((url.clone(), discussions_path), options.clone());
+    let pages_path = path.join("pages");
+    create_folder_if_not_exist(&pages_path).await?;
+    let pages = process_pages((url.clone(), pages_path), options.clone());
+    assignments.await?;
+    users.await?;
+    discussion.await?;
+    pages.await?;
+    Ok(())
+}
+
+async fn process_submissions(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let submissions_url = format!("{}{}", url, options.user.id);
+
+    let resp = options
+        .client
+        .get(submissions_url)
+        .bearer_auth(&options.canvas_token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let submissions_body = resp.text().await?;
+    let submissions_json = path.join("submission.json");
+    let submissions_json_path = submissions_json.to_string_lossy();
+    let mut submissions_file = std::fs::File::create(submissions_json.clone())
+        .with_context(|| format!("Unable to create file for {:?}", submissions_json_path))?;
+
+    submissions_file
+        .write_all(submissions_body.as_bytes())
+        .with_context(|| format!("Unable to write to file for {:?}", submissions_json_path))?;
+
+    let submissions_result = serde_json::from_str::<canvas::Submission>(&submissions_body);
+    match submissions_result {
+        Result::Ok(submissions) => {
+            for mut file in submissions.attachments {
+                let mut lock = options.files_to_download.lock().await;
+                let file_path = path.join(&file.display_name);
+                file.filepath = file_path;
+                lock.push(file);
+            }
+        }
+        Result::Err(e) => {
+            eprintln!("Error when getting submissions at link:{url}, path:{path:?}\n{e:?}",);
+        }
+    }
+    Ok(())
+}
+
+async fn process_assignments(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let assignments_url = format!("{}assignments", url);
+    let pages = get_pages(assignments_url, &options).await?;
+    
+    let assignments_json = path.join("assignments.json");
+    let assignments_json_path = assignments_json.to_string_lossy();
+    let mut assignments_file = std::fs::File::create(assignments_json.clone())
+        .with_context(|| format!("Unable to create file for {:?}", assignments_json_path))?;
+
+    let mut assignment_submissions = Vec::new();
+    for pg in pages {
+        let uri = pg.url().to_string();
+        let page_body = pg.text().await?;
+
+        assignments_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Unable to write to file for {:?}", assignments_json_path))?;
+
+        let assignment_result = serde_json::from_str::<canvas::AssignmentResult>(&page_body);
+
+        match assignment_result {
+            Ok(canvas::AssignmentResult::Ok(assignments)) => {
+                for assignment in assignments {
+                    let assignment_path = path.join(assignment.name);
+                    create_folder_if_not_exist(&assignment_path).await?;
+                    let submissions_url = format!("{}assignments/{}/submissions/", url, assignment.id);
+                    assignment_submissions.push(process_submissions((submissions_url, assignment_path), options.clone()));
+                }
+            }
+            Ok(canvas::AssignmentResult::Err { status }) => {
+                eprintln!(
+                    "Failed to access assignments at link:{uri}, path:{path:?}, status:{status}",
+                );
+            }
+            Err(e) => {
+                eprintln!("Error when getting assignments at link:{uri}, path:{path:?}\n{e:?}",);
+            }
+        }
+    }
+    join_all(assignment_submissions).await;
+    Ok(())
+}
+
+async fn process_users (
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let users_url = format!("{}users?include_inactive=true&include[]=avatar_url&include[]=enrollments&include[]=email&include[]=observed_users&include[]=can_be_removed&include[]=custom_links", url);
+    let pages = get_pages(users_url, &options).await?;
+    
+    let users_path = path.to_string_lossy();
+    let mut users_file = std::fs::File::create(path.clone())
+        .with_context(|| format!("Unable to create file for {:?}", users_path))?;
+
+    for pg in pages {
+        let page_body = pg.text().await?;
+
+        users_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Unable to write to file for {:?}", users_path))?;
+    }
+
+    Ok(())
+}
+
+async fn process_discussion_view(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let resp = options
+        .client
+        .get(&url)
+        .bearer_auth(&options.canvas_token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let discussion_view_body = resp.text().await?;
+    let discussion_view_json = path.join("discussion.json");
+    let discussion_view_json_path = discussion_view_json.to_string_lossy();
+    let mut discussion_view_file = std::fs::File::create(discussion_view_json.clone())
+        .with_context(|| format!("Unable to create file for {:?}", discussion_view_json_path))?;
+
+    discussion_view_file
+        .write_all(discussion_view_body.as_bytes())
+        .with_context(|| format!("Unable to write to file for {:?}", discussion_view_json_path))?;
+
+    let discussion_view_result = serde_json::from_str::<canvas::DiscussionView>(&discussion_view_body);
+    match discussion_view_result {
+        Result::Ok(discussion_view) => {
+            for view in discussion_view.view {
+                match view.attachments {
+                    Some(attachments) => {
+                        for mut file in attachments {
+                            let mut lock = options.files_to_download.lock().await;
+                            let file_path = path.join(format!("{}_{}", file.id, &file.display_name));
+                            file.filepath = file_path;
+                            lock.push(file);
+                        }
+                    },
+                    None => {
+
+                    }
+                }
+                match view.attachment {
+                    Some(mut attachment) => {
+                        let mut lock = options.files_to_download.lock().await;
+                        let file_path = path.join(format!("{}_{}", attachment.id, &attachment.display_name));
+                        attachment.filepath = file_path;
+                        lock.push(attachment);
+                    },
+                    None => {
+
+                    }
+                }
+            }
+        }
+        Result::Err(e) => {
+            eprintln!("Error when getting submissions at link:{url}, path:{path:?}\n{e:?}",);
+            println!("Received json {}", discussion_view_body);
+        }
+    }
+
+    Ok(())
+}
+async fn process_discussions(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let discussion_url = format!("{}discussion_topics", url);
+    let pages = get_pages(discussion_url, &options).await?;
+
+    let discussion_path = path.join("discussions.json");
+    let discussion_path_clone = discussion_path.clone();
+    let discussion_path_str = discussion_path_clone.to_string_lossy();
+    let mut discussion_file = std::fs::File::create(discussion_path)
+        .with_context(|| format!("Unable to create file for {:?}", discussion_path_str))?;
+
+    for pg in pages {
+        let uri = pg.url().to_string();
+        let page_body = pg.text().await?;
+
+        discussion_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Unable to write to file for {:?}", discussion_path_str))?;
+
+        let discussion_result = serde_json::from_str::<canvas::DiscussionResult>(&page_body);
+
+        match discussion_result {
+            Ok(canvas::DiscussionResult::Ok(discussions)) => {
+                for discussion in discussions {
+                    // download attachments
+                    let discussion_path = path.join(format!("{}_{}", discussion.id, sanitize_filename::sanitize(discussion.title)));
+                    create_folder_if_not_exist(&discussion_path).await?;
+                    for mut file in discussion.attachments {
+                        let mut lock = options.files_to_download.lock().await;
+                        let file_path = discussion_path.join(format!("{}_{}", file.id, &file.display_name));
+                        file.filepath = file_path;
+                        lock.push(file);
+                    }
+
+                    let view_url = format!("{}discussion_topics/{}/view", url, discussion.id);
+                    process_discussion_view((view_url, discussion_path), options.clone()).await?;
+                }
+            }
+            Ok(canvas::DiscussionResult::Err { status }) => {
+                eprintln!(
+                    "Failed to access discussions at link:{uri}, path:{path:?}, status:{status}",
+                );
+            }
+            Err(e) => {
+                eprintln!("Error when getting discussions at link:{uri}, path:{path:?}\n{e:?}",);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn process_pages(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let pages_url = format!("{}pages", url);
+    let pages = get_pages(pages_url, &options).await?;
+    
+    let pages_path = path.join("pages.json");
+    let pages_path_clone = pages_path.clone();
+    let pages_path_str = pages_path_clone.to_string_lossy();
+    let mut pages_file = std::fs::File::create(pages_path)
+        .with_context(|| format!("Unable to create file for {:?}", pages_path_str))?;
+
+    for pg in pages {
+        let uri = pg.url().to_string();
+        let page_body = pg.text().await?;
+
+        pages_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Could not write to file {:?}", pages_path_str))?;
+
+        let page_result = serde_json::from_str::<canvas::PageResult>(&page_body);
+
+        match page_result {
+            Ok(canvas::PageResult::Ok(pages)) => {
+                for page in pages {
+                    let page_url = format!("{}pages/{}", url, page.url);
+                    let page_resp = get_json(page_url, &options).await?;
+
+                    let page_file_path = path.join(format!("{}.json", page.url));
+
+                    let page_file_path_clone = page_file_path.clone();
+                    let page_file_path_str = page_file_path_clone.to_string_lossy();
+                    let mut page_file = std::fs::File::create(page_file_path)
+                        .with_context(|| format!("Unable to create file for {:?}", page_file_path_str))?;
+
+                    let page_resp_text = page_resp.text().await?;
+                    page_file
+                        .write_all(page_resp_text.as_bytes())
+                        .with_context(|| format!("Could not write to file {:?}", page_file_path_str))?;
+
+                    let page_body_result = serde_json::from_str::<canvas::PageBody>(&page_resp_text);
+                    match page_body_result {
+                        Result::Ok(page_body) => {
+                            let page_html = format!(
+                                "<html><head><title>{}</title></head><body>{}</body></html>",
+                                page_body.title, page_body.body);
+                            
+                            let page_html_path = path.join(format!("{}.html", page.url));
+                            let page_html_path_clone = page_html_path.clone();
+                            let page_html_path_str = page_html_path_clone.to_string_lossy();
+                            let mut page_html_file = std::fs::File::create(page_html_path)
+                                .with_context(|| format!("Unable to create file for {:?}", page_html_path_str))?;
+        
+                            page_html_file
+                                .write_all(page_html.as_bytes())
+                                .with_context(|| format!("Could not write to file {:?}", page_html_path_str))?;
+                        }
+                        Result::Err(e) => {
+                            eprintln!("Error when parsing page body at link:{uri}, path:{path:?}\n{e:?}",);
+                        }
+                    }
+
+                }
+            }
+
+            Ok(canvas::PageResult::Err { status }) => {
+                eprintln!("No pages found for url {} status: {}", uri, status);
+            }
+
+            Err(e) => {
+                eprintln!("No pages found for url {} error: {}", uri, e);
+            }
+        };
+    }
+
+    Ok(())
+}
+
 async fn process_files((url, path): (String, PathBuf), options: Arc<ProcessOptions>) -> Result<()> {
     let pages = get_pages(url, &options).await?;
 
@@ -493,12 +851,10 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Respons
             .get("current")
             .unwrap_or_else(|| panic!("Could not find current page for {}", resp.url()));
         let last = rels
-            .get("last")
-            .unwrap_or_else(|| panic!("Could not find last page for {}", resp.url()));
-        if cur == last {
+            .get("last")?;
+        if cur == last || cur == nex {
             return None;
         };
-
         // Next page
         Some(nex.raw_uri.clone())
     }
@@ -508,9 +864,16 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Respons
 
     while let Some(uri) = link {
         // GET request
+        let url = Url::parse_with_params(&uri, &[("","")])?;
+        let mut query_pairs : Vec<(String, String)> = Vec::new();
+        // insert into query_pairs from url.query_pairs();
+        for (key, value) in url.query_pairs() {
+            query_pairs.push((key.to_string(), value.to_string()));
+        }
         let resp = options
             .client
-            .get(&uri)
+            .get(url.as_str())
+            .query(&query_pairs)
             .bearer_auth(&options.canvas_token)
             .timeout(Duration::from_secs(10))
             .send()
@@ -522,6 +885,18 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Respons
     }
 
     Ok(resps)
+}
+
+async fn get_json(url: String, options: &ProcessOptions) -> Result<Response> {
+    let resp = options
+        .client
+        .get(&url)
+        .bearer_auth(&options.canvas_token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+
+    Ok(resp)
 }
 
 mod canvas {
@@ -543,6 +918,12 @@ mod canvas {
         pub name: String,
         pub course_code: String,
         pub enrollment_term_id: u32,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct User {
+        pub id: u32,
+        pub name: String,
     }
 
     #[derive(Deserialize)]
@@ -583,9 +964,83 @@ mod canvas {
         pub filepath: std::path::PathBuf,
     }
 
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum AssignmentResult {
+        Err { status: String },
+        Ok(Vec<Assignment>),
+    }
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Assignment {
+        pub id: u32,
+        pub name: String,
+        pub description: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Submission {
+        pub id: u32,
+        pub body: Option<String>,
+        pub attachments: Vec<File>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum DiscussionResult {
+        Err { status: String },
+        Ok(Vec<Discussion>),
+    }
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Discussion {
+        pub id: u32,
+        pub title: String,
+        pub message: String,
+        pub attachments: Vec<File>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct DiscussionView {
+        pub unread_entries: Vec<u32>,
+        pub view: Vec<Comments>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Comments {
+        pub id: u32,
+        pub attachment: Option<File>,
+        pub attachments: Option<Vec<File>>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum PageResult {
+        Err { status: String },
+        Ok(Vec<Page>),
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Page {
+        pub page_id: u32,
+        pub url: String,
+        pub title: String,
+        pub updated_at: String,
+        pub locked_for_user: bool,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct PageBody {
+        pub page_id: u32,
+        pub url: String,
+        pub title: String,
+        pub body: String,
+        pub updated_at: String,
+        pub locked_for_user: bool,
+    }
+
     pub struct ProcessOptions {
         pub canvas_token: String,
         pub client: reqwest::Client,
+        pub user: User,
         // Process
         pub download_newer: bool,
         pub files_to_download: Mutex<Vec<File>>,
