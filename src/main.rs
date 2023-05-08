@@ -567,13 +567,7 @@ async fn process_submissions(
 ) -> Result<()> {
     let submissions_url = format!("{}{}", url, options.user.id);
 
-    let resp = options
-        .client
-        .get(submissions_url)
-        .bearer_auth(&options.canvas_token)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?;
+    let resp = get_json(submissions_url, &options).await?;
     let submissions_body = resp.text().await?;
     let submissions_json = path.join("submission.json");
     let submissions_json_path = submissions_json.to_string_lossy();
@@ -671,13 +665,7 @@ async fn process_discussion_view(
     (url, path): (String, PathBuf),
     options: Arc<ProcessOptions>,
 ) -> Result<()> {
-    let resp = options
-        .client
-        .get(&url)
-        .bearer_auth(&options.canvas_token)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?;
+    let resp = get_json(url, &options).await?;
     let discussion_view_body = resp.text().await?;
     let discussion_view_json = path.join("discussion.json");
     let discussion_view_json_path = discussion_view_json.to_string_lossy();
@@ -822,13 +810,7 @@ async fn prepare_link_for_download(
     (link, path): (String, PathBuf),
     options: Arc<ProcessOptions>,
 ) -> Result<()> {
-    let resp = options
-        .client
-        .head(&link)
-        .bearer_auth(&options.canvas_token)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?;
+    let resp = get_json(link, &options).await?;
     let headers = resp.headers();
     // get filename out of Content-Disposition header
     let filename = headers
