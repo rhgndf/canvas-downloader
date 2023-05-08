@@ -94,6 +94,7 @@ dependencies = [
  "indicatif",
  "num_cpus",
  "parse_link_header",
+ "rand",
  "regex",
  "reqwest",
  "sanitize-filename",

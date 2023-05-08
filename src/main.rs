@@ -17,6 +17,7 @@ use std::{
 
 use anyhow::{Context, Error, Result};
 use chrono::DateTime;
+use chrono::Local;
 use clap::Parser;
 use futures::future::ready;
 use futures::future::join_all;
@@ -26,6 +27,7 @@ use reqwest::{header, Response, Url};
 use select::document::Document;
 use select::predicate::Name;
 use regex::Regex;
+use rand::Rng;
 
 use canvas::{File, ProcessOptions};
 
@@ -89,6 +91,7 @@ async fn main() -> Result<()> {
         .http2_keep_alive_interval(Some(Duration::from_secs(2)))
         .build()
         .with_context(|| "Failed to create HTTP client")?;
+
     let user_link = format!("{}/api/v1/users/self", cred.canvas_url);
     let user = client
         .get(&user_link)
@@ -98,6 +101,7 @@ async fn main() -> Result<()> {
         .json::<canvas::User>()
         .await
         .with_context(|| "Failed to get user info")?;
+
 
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url.clone());
     let options = Arc::new(ProcessOptions {
@@ -604,7 +608,6 @@ async fn process_assignments(
     let mut assignments_file = std::fs::File::create(assignments_json.clone())
         .with_context(|| format!("Unable to create file for {:?}", assignments_json_path))?;
 
-    let mut assignment_submissions = Vec::new();
     for pg in pages {
         let uri = pg.url().to_string();
         let page_body = pg.text().await?;
@@ -621,8 +624,18 @@ async fn process_assignments(
                     let assignment_path = path.join(assignment.name);
                     create_folder_if_not_exist(&assignment_path).await?;
                     let submissions_url = format!("{}assignments/{}/submissions/", url, assignment.id);
-                    assignment_submissions.push(process_submissions((submissions_url, assignment_path.clone()), options.clone()));
-                    process_html_links((assignment.description, assignment_path), options.clone()).await?;
+                    fork!(
+                        process_submissions,
+                        (submissions_url, assignment_path.clone()),
+                        (String, PathBuf),
+                        options.clone()
+                    );
+                    fork!(
+                        process_html_links,
+                        (assignment.description, assignment_path),
+                        (String, PathBuf),
+                        options.clone()
+                    );
                 }
             }
             Ok(canvas::AssignmentResult::Err { status }) => {
@@ -635,7 +648,6 @@ async fn process_assignments(
             }
         }
     }
-    join_all(assignment_submissions).await;
     Ok(())
 }
 
@@ -665,7 +677,7 @@ async fn process_discussion_view(
     (url, path): (String, PathBuf),
     options: Arc<ProcessOptions>,
 ) -> Result<()> {
-    let resp = get_json(url, &options).await?;
+    let resp = get_json(url.clone(), &options).await?;
     let discussion_view_body = resp.text().await?;
     let discussion_view_json = path.join("discussion.json");
     let discussion_view_json_path = discussion_view_json.to_string_lossy();
@@ -683,7 +695,12 @@ async fn process_discussion_view(
             for view in discussion_view.view {
                 match view.message {
                     Some(message) => {
-                        process_html_links((message, path.clone()), options.clone()).await?;
+                        fork!(
+                            process_html_links,
+                            (message, path.clone()),
+                            (String, PathBuf),
+                            options.clone()
+                        )
                     },
                     None => {
 
@@ -729,7 +746,7 @@ async fn process_discussions(
     (url, announcement, path): (String, bool, PathBuf),
     options: Arc<ProcessOptions>,
 ) -> Result<()> {
-    let discussion_url = format!("{}discussion_topics?only_announcements={}", url, announcement);
+    let discussion_url = format!("{}discussion_topics{}", url, if announcement { "?only_announcements={}" } else { "" });
     let pages = get_pages(discussion_url, &options).await?;
 
     let discussion_path = path.join("discussions.json");
@@ -767,11 +784,20 @@ async fn process_discussions(
                         let mut lock = options.files_to_download.lock().await;
                         lock.append(&mut filtered_files);
                     }
-
-
-                    process_html_links((discussion.message, discussion_path.clone()), options.clone()).await?;
+                    
+                    fork!(
+                        process_html_links,
+                        (discussion.message, discussion_path.clone()),
+                        (String, PathBuf),
+                        options.clone()
+                    );
                     let view_url = format!("{}discussion_topics/{}/view", url, discussion.id);
-                    process_discussion_view((view_url, discussion_path), options.clone()).await?;
+                    fork!(
+                        process_discussion_view,
+                        (view_url, discussion_path),
+                        (String, PathBuf),
+                        options.clone()
+                    )
                 }
             }
             Ok(canvas::DiscussionResult::Err { status }) => {
@@ -789,7 +815,7 @@ async fn process_discussions(
 async fn process_file_id(
     (url, path): (String, PathBuf),
     options: Arc<ProcessOptions>,
-) -> Result<()> {
+) -> Result<File> {
     let file_resp = get_json(url.clone(), &options).await?;
     
     let file_result = file_resp.json::<canvas::File>().await;
@@ -797,20 +823,26 @@ async fn process_file_id(
         Result::Ok(mut file) => {
             let file_path = path.join(&file.display_name);
             file.filepath = file_path;
-            let mut lock = options.files_to_download.lock().await;
-            lock.push(file);
+            return Ok(file);
         }
         Err(e) => {
             eprintln!("Error when getting file at link:{url}, path:{path:?}\n{e:?}",);
+            return Err(Into::into(e));
         }
     }
-    Ok(())
 }
 async fn prepare_link_for_download(
     (link, path): (String, PathBuf),
     options: Arc<ProcessOptions>,
-) -> Result<()> {
-    let resp = get_json(link, &options).await?;
+) -> Result<File> {
+
+    let resp = options
+        .client
+        .head(&link)
+        .bearer_auth(&options.canvas_token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
     let headers = resp.headers();
     // get filename out of Content-Disposition header
     let filename = headers
@@ -829,6 +861,15 @@ async fn prepare_link_for_download(
                 .map(|x| x.as_str())
                 .unwrap_or("unknown")
         });
+    // last-modified header to TZ string
+    let updated_at = headers
+        .get(header::LAST_MODIFIED)
+        .and_then(|x| x.to_str().ok())
+        .and_then(|x| {
+            let dt = DateTime::parse_from_rfc2822(x).ok()?;
+            Some(dt.with_timezone(&Local).to_rfc3339())
+        })
+        .unwrap_or_else(|| Local::now().to_rfc3339());
     
     let file = File {
         id: 0,
@@ -836,13 +877,11 @@ async fn prepare_link_for_download(
         display_name: filename.to_string(),
         size: 0,
         url: link.clone(),
-        updated_at: "".to_string(),
+        updated_at: updated_at,
         locked_for_user: false,
         filepath: path.join(filename),
     };
-    let mut lock = options.files_to_download.lock().await;
-    lock.push(file);
-    Ok(())
+    Ok(file)
 }
 
 async fn process_html_links(
@@ -861,8 +900,12 @@ async fn process_html_links(
         .map(|x| format!("{}/api/v1{}", options.canvas_url, x.path()))
         .collect::<Vec<String>>();
     
-    join_all(file_links.into_iter()
-        .map(|x| process_file_id((x, path.clone()), options.clone()))).await;
+    let mut link_files = join_all(file_links.into_iter()
+        .map(|x| process_file_id((x, path.clone()), options.clone())))
+        .await
+        .into_iter()
+        .filter_map(|x| x.ok())
+        .collect::<Vec<File>>();
 
     //let re_image = Regex::new(r"/courses/[0-9]+/files/[0-9]+").unwrap();
     let image_links = Document::from(html.as_str())
@@ -873,8 +916,17 @@ async fn process_html_links(
         .map(|x| x.to_string())
         .collect::<Vec<String>>();
     
-    join_all(image_links.into_iter()
-        .map(|x| prepare_link_for_download((x, path.clone()), options.clone()))).await;
+    link_files.append(join_all(image_links.into_iter()
+        .map(|x| prepare_link_for_download((x, path.clone()), options.clone())))
+        .await
+        .into_iter()
+        .filter_map(|x| x.ok())
+        .collect::<Vec<File>>().as_mut());
+
+    let mut filtered_files = filter_files(&options, &path, link_files);
+    let mut lock = options.files_to_download.lock().await;
+    lock.append(&mut filtered_files);
+
     Ok(())
 }
 async fn process_page_body(
@@ -947,8 +999,12 @@ async fn process_pages(
                     let page_url = format!("{}pages/{}", url, page.url);
                     let page_file_path = path.join(page.url.clone());
                     create_folder_if_not_exist(&page_file_path).await?;
-                    process_page_body((page_url, page.url, page_file_path), options.clone()).await?;
-
+                    fork!(
+                        process_page_body,
+                        (page_url, page.url, page_file_path),
+                        (String, String, PathBuf),
+                        options.clone()
+                    )
                 }
             }
 
@@ -1076,20 +1132,7 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Respons
 
     while let Some(uri) = link {
         // GET request
-        let url = Url::parse(&uri)?;
-        let mut query_pairs : Vec<(String, String)> = Vec::new();
-        // insert into query_pairs from url.query_pairs();
-        for (key, value) in url.query_pairs() {
-            query_pairs.push((key.to_string(), value.to_string()));
-        }
-        let resp = options
-            .client
-            .get(url.as_str())
-            .query(&query_pairs)
-            .bearer_auth(&options.canvas_token)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?;
+        let resp = get_json(uri, options).await?;
 
         // Get next page before returning for json
         link = parse_next_page(&resp);
@@ -1100,15 +1143,36 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Respons
 }
 
 async fn get_json(url: String, options: &ProcessOptions) -> Result<Response> {
-    let resp = options
-        .client
-        .get(&url)
-        .bearer_auth(&options.canvas_token)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?;
+    let mut query_pairs : Vec<(String, String)> = Vec::new();
+    // insert into query_pairs from url.query_pairs();
+    for (key, value) in Url::parse(&url)?.query_pairs() {
+        query_pairs.push((key.to_string(), value.to_string()));
+    }
+    for retry in 0..3 {
+        let resp = options
+            .client
+            .get(&url)
+            .query(&query_pairs)
+            .bearer_auth(&options.canvas_token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
 
-    Ok(resp)
+        match resp {
+            Ok(resp) => {
+                if resp.status() != reqwest::StatusCode::FORBIDDEN || retry == 2 {
+                    return Ok(resp)
+                }
+            },
+            Err(e) => {println!("get_json {}", e); return Err(e.into())},
+        }
+
+        let wait_time = Duration::from_millis(rand::thread_rng().gen_range(0..1000));
+        println!("Got 403 for {}, waiting {:?} before retrying, retry {}", url, wait_time, retry);
+        tokio::time::sleep(wait_time).await;
+        
+    }
+    Err(Error::msg("get_json failed"))
 }
 
 mod canvas {
