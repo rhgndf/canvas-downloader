@@ -540,70 +540,81 @@ async fn process_video_folder(
     file.write_all(folderinfo.as_bytes())?;
 
     // POST json folderID: to https://mediaweb.ap.panopto.com/Panopto/Services/Data.svc/GetSessions
-    let sessions_result = client
-        .post(format!("https://{}/Panopto/Services/Data.svc/GetSessions", host))
-        .json(&json!({
-            "queryParameters":
-            {
-                "query":null,
-                "sortColumn":1,
-                "sortAscending":false,
-                "maxResults":100,
-                "page":0,
-                "startDate":null,
-                "endDate":null,
-                "folderID":id,
-                "bookmarked":false,
-                "getFolderData":true,
-                "isSharedWithMe":false,
-                "isSubscriptionsPage":false,
-                "includeArchived":true,
-                "includeArchivedStateCount":true,
-                "sessionListOnlyArchived":false,
-                "includePlaylists":true
-            }
-        }))
-        .send()
-        .await?;
+
     // write into sessions.json
-    let sessions_text = sessions_result.text().await?;
     let mut sessions_file = std::fs::File::create(path.join("sessions.json"))?;
-    sessions_file.write_all(sessions_text.as_bytes())?;
+
+    for i in 0.. {
+        let sessions_result = client
+            .post(format!("https://{}/Panopto/Services/Data.svc/GetSessions", host))
+            .json(&json!({
+                "queryParameters":
+                {
+                    "query":null,
+                    "sortColumn":1,
+                    "sortAscending":false,
+                    "maxResults":100,
+                    "page":i,
+                    "startDate":null,
+                    "endDate":null,
+                    "folderID":id,
+                    "bookmarked":false,
+                    "getFolderData":true,
+                    "isSharedWithMe":false,
+                    "isSubscriptionsPage":false,
+                    "includeArchived":true,
+                    "includeArchivedStateCount":true,
+                    "sessionListOnlyArchived":false,
+                    "includePlaylists":true
+                }
+            }))
+            .send()
+            .await?;
+
+        let sessions_text = sessions_result.text().await?;
+        sessions_file.write_all(sessions_text.as_bytes())?;
+        let folder_sessions = serde_json::from_str::<Value>(&sessions_text);
+        if folder_sessions.is_err() {
+            eprintln!("Error parsing sessions: {}", folder_sessions.err().unwrap());
+            return Ok(());
+        }
+        let folder_sessions_unwrap = folder_sessions.unwrap();
+        let folder_sessions_results = folder_sessions_unwrap.get("d");
+        if folder_sessions_results.is_none() {
+            eprintln!("Error parsing sessions");
+            return Ok(());
+        }
     
-    let folder_sessions = serde_json::from_str::<Value>(&sessions_text);
-    if folder_sessions.is_err() {
-        eprintln!("Error parsing sessions: {}", folder_sessions.err().unwrap());
-        return Ok(());
-    }
-    let folder_sessions_unwrap = folder_sessions.unwrap();
-    let folder_sessions_results = folder_sessions_unwrap.get("d");
-    if folder_sessions_results.is_none() {
-        eprintln!("Error parsing sessions");
-        return Ok(());
-    }
-    match serde_json::from_value::<canvas::PanoptoSessionInfo>(folder_sessions_results.unwrap().clone()) {
-        Result::Ok(sessions) => {
-            for result in sessions.Results {
-                fork!(
-                    process_session,
-                    (host.clone(), result, client.clone(), path.clone()),
-                    (String, canvas::PanoptoResult, reqwest::Client, PathBuf),
-                    options.clone()
-                )
+        match serde_json::from_value::<canvas::PanoptoSessionInfo>(folder_sessions_results.unwrap().clone()) {
+            Result::Ok(sessions) => {
+                if sessions.Results.len() == 0 {
+                    break;
+                }
+                for result in sessions.Results {
+                    println!("{} {} {}", id, i, result.SessionName);
+                    fork!(
+                        process_session,
+                        (host.clone(), result, client.clone(), path.clone()),
+                        (String, canvas::PanoptoResult, reqwest::Client, PathBuf),
+                        options.clone()
+                    )
+                }
+                if i == 0 {
+                    for subfolder in sessions.Subfolders {
+                        let subfolder_path = path.join(subfolder.Name);
+                        create_folder_if_not_exist(&subfolder_path).await?;
+                        fork!(
+                            process_video_folder,
+                            (host.clone(), subfolder.ID, client.clone(), subfolder_path),
+                            (String, String, reqwest::Client, PathBuf),
+                            options.clone()
+                        );
+                    }
+                }
+            },
+            Result::Err(e) => {
+                eprintln!("Error parsing sessions: {}", e);
             }
-            for subfolder in sessions.Subfolders {
-                let subfolder_path = path.join(subfolder.Name);
-                create_folder_if_not_exist(&subfolder_path).await?;
-                fork!(
-                    process_video_folder,
-                    (host.clone(), subfolder.ID, client.clone(), subfolder_path),
-                    (String, String, reqwest::Client, PathBuf),
-                    options.clone()
-                );
-            }
-        },
-        Result::Err(e) => {
-            eprintln!("Error parsing sessions: {}", e);
         }
     }
     Ok(())
