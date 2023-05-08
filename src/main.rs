@@ -14,20 +14,27 @@ use std::{
     },
     io::Write
 };
+use std::ffi::OsStr;
 
 use anyhow::{Context, Error, Result};
 use chrono::DateTime;
 use chrono::Local;
+use chrono::Utc;
+use chrono::TimeZone;
 use clap::Parser;
 use futures::future::ready;
 use futures::future::join_all;
 use futures::{stream, StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{header, Response, Url};
+use reqwest::header::HeaderValue;
 use select::document::Document;
 use select::predicate::Name;
 use regex::Regex;
 use rand::Rng;
+use serde_json::json;
+use serde_json::Value;
+use m3u8_rs::Playlist;
 
 use canvas::{File, ProcessOptions};
 
@@ -199,8 +206,17 @@ async fn main() -> Result<()> {
 
         fork!(
             process_data,
-            (course_data_link, course_folder_path),
+            (course_data_link, course_folder_path.clone()),
             (String, PathBuf),
+            options.clone()
+        );
+
+        let video_folder_path = course_folder_path.join("videos");
+        create_folder_if_not_exist(&video_folder_path).await?;
+        fork!(
+            process_videos,
+            (cred.canvas_url.clone(), course.id, video_folder_path),
+            (String, u32, PathBuf),
             options.clone()
         )
     }
@@ -397,6 +413,274 @@ fn print_all_courses_by_term(courses: &[canvas::Course]) {
     for (key, value) in &grouped_courses {
         println!("{: <10}| {:?}", key, value);
     }
+}
+async fn process_session(
+    (host, result, client, path):
+    (String, canvas::PanoptoResult, reqwest::Client, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    // POST json sessionID: to https://mediaweb.ap.panopto.com/Panopto/Pages/Viewer/DeliveryInfo.aspx
+    let resp = client
+        .post(format!("https://{}/Panopto/Pages/Viewer/DeliveryInfo.aspx", host))
+        .form(&[
+            ("deliveryId",result.DeliveryID.as_str()),
+            ("invocationId",""),
+            ("isLiveNotes","false"),
+            ("refreshAuthCookie","true"),
+            ("isActiveBroadcast","false"),
+            ("isEditing","false"),
+            ("isKollectiveAgentInstalled","false"),
+            ("isEmbed","false"),
+            ("responseType","json"),
+        ])
+        .send()
+        .await?;
+
+    let delivery_info_result = resp.json::<canvas::PanoptoDeliveryInfo>().await;
+    match delivery_info_result {
+        Result::Ok(delivery_info) => {
+            let viewer_file_id = delivery_info.ViewerFileId;
+            let panopto_url = Url::parse(&result.IosVideoUrl);
+            if panopto_url.is_err() {
+                eprintln!("Failed to parse panopto url {}", result.IosVideoUrl);
+                return Ok(());
+            }
+            let panopto_url_unwrap = panopto_url.unwrap();
+            let panopto_cdn_host = panopto_url_unwrap.host_str().unwrap_or("s-cloudfront.cdn.ap.panopto.com");
+            let panopto_master_m3u8 = format!("https://{}/sessions/{}/{}-{}.hls/master.m3u8", panopto_cdn_host, result.SessionID, result.DeliveryID, viewer_file_id);
+            let m3u8_resp = client
+                .get(panopto_master_m3u8)
+                .send()
+                .await?;
+            let m3u8_text = m3u8_resp.text().await?;
+            let m3u8_parser = m3u8_rs::parse_playlist_res(m3u8_text.as_bytes());
+            match m3u8_parser {
+                Ok(Playlist::MasterPlaylist(pl)) => {
+                    // get the highest bandwidth
+                    let download_variant = pl.variants
+                        .iter()
+                        .max_by_key(|v| v.bandwidth)
+                        .unwrap();
+
+                    let panopto_index_m3u8 = format!("https://{}/sessions/{}/{}-{}.hls/{}", panopto_cdn_host, result.SessionID, result.DeliveryID, viewer_file_id, download_variant.uri);
+                    
+                    let index_m3u8_resp = client
+                        .get(panopto_index_m3u8)
+                        .send()
+                        .await?;
+                    let index_m3u8_text = index_m3u8_resp.text().await?;
+                    let index_m3u8_parser = m3u8_rs::parse_playlist_res(index_m3u8_text.as_bytes());
+                    match index_m3u8_parser {
+                        Ok(Playlist::MasterPlaylist(_index_pl)) => {},
+                        Ok(Playlist::MediaPlaylist(index_pl)) => {
+                            let uri_id = download_variant.uri.split("/").next().unwrap();
+                            let file_uri = index_pl.segments[0].uri.clone();
+                            let file_uri_ext = Path::new(&file_uri).extension().unwrap_or(OsStr::new("")).to_str().unwrap_or("");
+                            let panopto_mp4_file = format!("https://{}/sessions/{}/{}-{}.hls/{}/{}", panopto_cdn_host, result.SessionID, result.DeliveryID, viewer_file_id, uri_id, file_uri);
+                            let download_file_name = if file_uri_ext == "" {
+                                format!("{}", result.SessionName)
+                            } else {
+                                format!("{}.{}", result.SessionName, file_uri_ext)
+                            };
+
+                            let date_regex = Regex::new(r"/Date\((\d+)\)/").unwrap();
+                            let date_match = date_regex.captures(&result.StartTime);
+                            let date_match_unwrap = date_match.unwrap();
+                            let date_match_str = date_match_unwrap.get(1).unwrap().as_str();
+                            let date_match_int = date_match_str.parse::<i64>().unwrap();
+                            let date_match_utc = Utc.timestamp_millis_opt(date_match_int).unwrap();
+                            let date_match_rfc3339 = date_match_utc.to_rfc3339();
+
+                            let file = canvas::File {
+                                display_name: download_file_name,
+                                folder_id: 0,
+                                id: 0,
+                                size: 0,
+                                url: panopto_mp4_file,
+                                locked_for_user: false,
+                                updated_at: date_match_rfc3339,
+                                filepath: path.clone(),
+                            };
+                            let mut lock = options.files_to_download.lock().await;
+                            let mut filtered_files = filter_files(&options, &path, [file].to_vec());
+                            lock.append(&mut filtered_files);
+                        },
+                        Err(e) => println!("Error: {:?}", e),
+                    }
+                    
+                }
+                Ok(Playlist::MediaPlaylist(_pl)) => {},
+                Err(e) => println!("Error: {:?}", e),
+            }
+        },
+        Err(e) => {
+            eprintln!("Failed to get delivery info for session {}, err={:?}", result.SessionID, e);
+        }
+    }
+
+    //println!("Processing session DeliveryID: {}, FolderID: {}, SessionID: {}", result.DeliveryID, result.FolderID, result.SessionID);
+    Ok(())
+}
+async fn process_video_folder(
+    (host, id, client, path):
+    (String, String, reqwest::Client, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    // POST json folderID: to https://mediaweb.ap.panopto.com/Panopto/Services/Data.svc/GetFolderInfo
+    let folderinfo_result = client
+        .post(format!("https://{}/Panopto/Services/Data.svc/GetFolderInfo", host))
+        .json(&json!({
+            "folderID": id,
+        }))
+        .send()
+        .await?;
+    // write into videos.json
+    let folderinfo = folderinfo_result.text().await?;
+    let mut file = std::fs::File::create(path.join("folder.json"))?;
+    file.write_all(folderinfo.as_bytes())?;
+
+    // POST json folderID: to https://mediaweb.ap.panopto.com/Panopto/Services/Data.svc/GetSessions
+    let sessions_result = client
+        .post(format!("https://{}/Panopto/Services/Data.svc/GetSessions", host))
+        .json(&json!({
+            "queryParameters":
+            {
+                "query":null,
+                "sortColumn":1,
+                "sortAscending":false,
+                "maxResults":100,
+                "page":0,
+                "startDate":null,
+                "endDate":null,
+                "folderID":id,
+                "bookmarked":false,
+                "getFolderData":true,
+                "isSharedWithMe":false,
+                "isSubscriptionsPage":false,
+                "includeArchived":true,
+                "includeArchivedStateCount":true,
+                "sessionListOnlyArchived":false,
+                "includePlaylists":true
+            }
+        }))
+        .send()
+        .await?;
+    // write into sessions.json
+    let sessions_text = sessions_result.text().await?;
+    let mut sessions_file = std::fs::File::create(path.join("sessions.json"))?;
+    sessions_file.write_all(sessions_text.as_bytes())?;
+    
+    let folder_sessions = serde_json::from_str::<Value>(&sessions_text);
+    if folder_sessions.is_err() {
+        eprintln!("Error parsing sessions: {}", folder_sessions.err().unwrap());
+        return Ok(());
+    }
+    let folder_sessions_unwrap = folder_sessions.unwrap();
+    let folder_sessions_results = folder_sessions_unwrap.get("d");
+    if folder_sessions_results.is_none() {
+        eprintln!("Error parsing sessions");
+        return Ok(());
+    }
+    match serde_json::from_value::<canvas::PanoptoSessionInfo>(folder_sessions_results.unwrap().clone()) {
+        Result::Ok(sessions) => {
+            for result in sessions.Results {
+                fork!(
+                    process_session,
+                    (host.clone(), result, client.clone(), path.clone()),
+                    (String, canvas::PanoptoResult, reqwest::Client, PathBuf),
+                    options.clone()
+                )
+            }
+            for subfolder in sessions.Subfolders {
+                let subfolder_path = path.join(subfolder.Name);
+                create_folder_if_not_exist(&subfolder_path).await?;
+                fork!(
+                    process_video_folder,
+                    (host.clone(), subfolder.ID, client.clone(), subfolder_path),
+                    (String, String, reqwest::Client, PathBuf),
+                    options.clone()
+                );
+            }
+        },
+        Result::Err(e) => {
+            eprintln!("Error parsing sessions: {}", e);
+        }
+    }
+    Ok(())
+}
+async fn process_videos(
+    (url, id, path):
+    (String, u32, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let session = get_json(format!("{}/login/session_token?return_to={}/courses/{}/external_tools/128", url, url, id), &options).await?;
+    let session_result = session.json::<canvas::Session>().await?;
+
+    let client = reqwest::ClientBuilder::new()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let videos = client
+        .get(session_result.session_url)
+        .send()
+        .await?;
+    let video_html = videos.text().await.unwrap_or("".to_string());
+    let video_html_bytes = video_html.as_bytes();
+    let (action, params) = {
+        let panopto_document = Document::from_read(video_html_bytes);
+        if panopto_document.is_err() {
+            return Ok(());
+        }
+        let panopto_all_forms = panopto_document.unwrap();
+        let panopto_form_optional = panopto_all_forms
+            .find(Name("form"))
+            .filter(|n| n.attr("data-tool-id") == Some("mediaweb.ap.panopto.com"))
+            .next();
+        if panopto_form_optional.is_none() {
+            return Ok(());
+        }
+        let panopto_form = panopto_form_optional.unwrap();
+        let action = panopto_form.attr("action").unwrap_or("").to_string();
+        let params = panopto_form
+            .find(Name("input"))
+            .filter_map(|n| n.attr("name").map(|name| (name.to_string(), n.attr("value").unwrap_or("").to_string())))
+            .collect::<Vec<(_, _)>>();
+        (action, params)
+    };
+    // set origin and referral
+    let panopto_response = client
+        .post(action)
+        .header("Origin", &url)
+        .header("Referer", format!("{}/", url))
+        .form(&params)
+        .send()
+        .await?;
+
+    // parse location header as url
+    let panopto_location = Url::parse(panopto_response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap_or(&HeaderValue::from_static(""))
+        .to_str()
+        .unwrap_or(""))?;
+    // get folderID from query string
+    let panopto_folder_id = panopto_location
+        .query_pairs()
+        .find(|(key, _)| key == "folderID")
+        .map(|(_, value)| value)
+        .unwrap_or(std::borrow::Cow::Borrowed(""))
+        .to_string();
+    let panopto_host = panopto_location.host_str().unwrap_or("").to_string();
+    // error handling
+    if panopto_folder_id == "" || panopto_host == "" {
+        return Err(Error::msg("Could not get Panopto Folder ID"));
+    }
+    
+    process_video_folder((panopto_host, panopto_folder_id, client.clone(), path), options).await?;
+
+    //println!("Panopto Folder Name: {}", folderinfo.id);
+    //println!("Panopto Folder ID: {} {} {}", id, panopto_host, panopto_folder_id);
+    Ok(())
 }
 // async recursion needs boxing
 async fn process_folders(
@@ -1312,6 +1596,45 @@ mod canvas {
         pub body: String,
         pub updated_at: String,
         pub locked_for_user: bool,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Session {
+        pub session_url: String,
+        pub requires_terms_acceptance: bool,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[allow(non_snake_case)]
+    pub struct PanoptoSessionInfo {
+        pub TotalNumber: u32,
+        pub Results: Vec<PanoptoResult>,
+        pub Subfolders: Vec<PanoptoSubfolder>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[allow(non_snake_case)]
+    pub struct PanoptoResult {
+        pub DeliveryID: String,
+        pub FolderID: String,
+        pub SessionID: String,
+        pub SessionName: String,
+        pub StartTime: String,
+        pub IosVideoUrl: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    #[allow(non_snake_case)]
+    pub struct PanoptoSubfolder {
+        pub ID: String,
+        pub Name: String,
+    }
+    
+    #[derive(Clone, Debug, Deserialize)]
+    #[allow(non_snake_case)]
+    pub struct PanoptoDeliveryInfo {
+        pub SessionId: String,
+        pub ViewerFileId: String,
     }
 
     pub struct ProcessOptions {
