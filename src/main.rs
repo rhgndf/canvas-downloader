@@ -506,6 +506,7 @@ async fn process_videos(
         .host_str()
         .ok_or(anyhow!("Could not get Panopto Host"))?
         .to_string();
+        
     process_video_folder((panopto_host, panopto_folder_id, client.clone(), path), options).await?;
     Ok(())
 }
@@ -568,18 +569,6 @@ async fn process_video_folder(
     
         let sessions = serde_json::from_value::<canvas::PanoptoSessionInfo>(folder_sessions_results.clone())?;
         
-        // End of page results
-        if sessions.Results.len() == 0 {
-            break;
-        }
-        for result in sessions.Results {
-            fork!(
-                process_session,
-                (host.clone(), result, client.clone(), path.clone()),
-                (String, canvas::PanoptoResult, reqwest::Client, PathBuf),
-                options.clone()
-            )
-        }
         // Subfolders are the same, so process only the first request
         if i == 0 {
             for subfolder in sessions.Subfolders {
@@ -592,6 +581,18 @@ async fn process_video_folder(
                     options.clone()
                 );
             }
+        }
+        // End of page results
+        if sessions.Results.len() == 0 {
+            break;
+        }
+        for result in sessions.Results {
+            fork!(
+                process_session,
+                (host.clone(), result, client.clone(), path.clone()),
+                (String, canvas::PanoptoResult, reqwest::Client, PathBuf),
+                options.clone()
+            )
         }
     }
     Ok(())
